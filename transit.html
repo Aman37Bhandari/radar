@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Exoplanet Transit Mission Control</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.js"></script>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden; 
+      background-color: #050505;
+      font-family: sans-serif;
+    }
+    
+    canvas {
+      display: block; 
+    }
+
+    .interface-btn {
+      position: absolute; 
+      padding: 12px 24px;
+      background-color: #1a1a1a;
+      color: #0f0;
+      border: 1px solid #0f0;
+      font-weight: bold;
+      cursor: pointer;
+      font-size: 16px;
+      transition: all 0.2s;
+      font-family: sans-serif;
+      z-index: 100; 
+      border-radius: 3px;
+    }
+
+    .interface-btn:hover:not(:disabled) {
+      background-color: #0f0;
+      color: #000;
+    }
+
+    .interface-btn:disabled {
+      border-color: #555;
+      color: #888;
+      cursor: not-allowed;
+    }
+
+    #connect-btn {
+      top: 20px;
+      left: 20px;
+    }
+
+    #lock-star-btn {
+      top: 400px; 
+      right: 40px; 
+      width: 270px;
+      display: none; 
+    }
+  </style>
+</head>
+<body>
+
+  <button id="connect-btn" class="interface-btn">CONNECT SENSOR PORT</button>
+  <button id="lock-star-btn" class="interface-btn">LOCK STAR (SET BASELINE)</button>
+
+  <script>
+    // --- VARIABLES ---
+    let luxValue = 0;
+    let maxLux = 0; 
+    let minLuxDuringTransit = 999999;
+    let planetX = -200;
+    let starSize = 400;
+
+    const triggerThreshold = 0.98; 
+    const resetThreshold = 0.99;   
+
+    let transitActive = false; 
+    let animating = false;
+    let systemReady = false;   
+    let recordedDipRatio = 0;
+    
+    // Calibration state
+    let calibrating = false;
+    let calibrationStartTime = 0;
+    const calibrationDuration = 2000; 
+
+    let historyData = new Array(400).fill(0);
+
+    let port;
+    let reader;
+
+    // UI Button elements
+    let connectBtn;
+    let lockStarBtn;
+
+    // --- KALMAN FILTER VARIABLES ---
+    let kf_err_measure = 2.0;  
+    let kf_err_estimate = 2.0; 
+    let kf_q = 0.05;           
+    let kf_current_estimate = 0;
+    let kalmanInitialized = false;
+
+    // --- P5.JS SETUP ---
+    function setup() {
+      createCanvas(windowWidth, windowHeight);
+      
+      connectBtn = document.getElementById('connect-btn');
+      connectBtn.addEventListener('click', connectSerial);
+
+      lockStarBtn = document.getElementById('lock-star-btn');
+      lockStarBtn.addEventListener('click', startCalibration);
+    }
+
+    // --- P5.JS DRAW LOOP ---
+    function draw() {
+      background(5); 
+      
+      cursor(ARROW);
+
+      // Continually track upper bounds if room gets slightly brighter, 
+      // but only if we aren't mid-transit or mid-calibration.
+      if (systemReady && !calibrating && luxValue > maxLux) {
+        maxLux = luxValue;
+      }
+
+      if (maxLux < 2) return; 
+
+      let currentRatio = luxValue / maxLux;
+      
+      // Update Real-time Graph History
+      for (let i = 0; i < 399; i++) historyData[i] = historyData[i+1];
+      historyData[399] = currentRatio * 100;
+
+      // --- TRANSIT STATE MACHINE ---
+
+      if (calibrating) {
+        let elapsed = millis() - calibrationStartTime;
+        if (elapsed >= calibrationDuration) {
+          calibrating = false;
+          lockStarBtn.disabled = false;
+          lockStarBtn.innerText = "LOCK STAR (SET BASELINE)";
+          systemReady = true; // Arm the system!
+        }
+      }
+
+      // 1. Detection Phase (Triggered when light dips)
+      if (systemReady && !calibrating && currentRatio < triggerThreshold) {
+        transitActive = true;
+        systemReady = false; // Disable scanning while we record the dip
+        minLuxDuringTransit = luxValue;
+      }
+
+      // 2. Recording Phase
+      if (transitActive) {
+        if (luxValue < minLuxDuringTransit) minLuxDuringTransit = luxValue;
+        
+        // 3. Recovery Phase (Light returned to normal)
+        if (currentRatio > resetThreshold) {
+          transitActive = false;
+          animating = true;
+          planetX = -200;
+          recordedDipRatio = 1.0 - (minLuxDuringTransit / maxLux);
+        }
+      }
+
+      // --- DRAWING ---
+      let starBrightness = map(luxValue, 0, maxLux, 100, 255);
+      drawStar(width/2, height/2, starSize, starBrightness);
+
+      if (animating) {
+        planetX += 20; 
+        let visualPlanetSize = starSize * (recordedDipRatio * 4.0);
+        fill(0);
+        noStroke();
+        ellipse(planetX, height/2, visualPlanetSize, visualPlanetSize);
+
+        // 4. Reset Phase: Animation finished, AUTOMATICALLY RE-ARM!
+        if (planetX > width + 200) {
+          animating = false;
+          systemReady = true; // <--- This loops it back to continuous live detection!
+        }
+      }
+
+      drawUI(currentRatio);
+      drawGraph();
+    }
+
+    function startCalibration() {
+      // Forcefully reset the maxLux baseline to current reading
+      maxLux = luxValue; 
+      calibrating = true;
+      calibrationStartTime = millis();
+      
+      // Abort any ongoing detections/animations
+      systemReady = false;
+      transitActive = false;
+      animating = false;
+      
+      lockStarBtn.innerText = "CALIBRATING...";
+      lockStarBtn.disabled = true;
+    }
+
+    function drawUI(ratio) {
+      let sw = 350;
+      fill(15, 200);
+      noStroke();
+      rect(width-sw, 0, sw, height);
+      
+      textAlign(LEFT);
+      fill(255);
+      textSize(24);
+      text("MISSION CONTROL", width-320, 80);
+      stroke(255, 100);
+      line(width-320, 100, width-50, 100);
+      
+      noStroke();
+      textSize(16);
+      fill(180);
+      text("STARDUST INTENSITY:", width-320, 150);
+      fill(255);
+      text(luxValue.toFixed(1) + " LUX", width-320, 175);
+      
+      fill(180);
+      text("LIGHT RATIO:", width-320, 230);
+      
+      if (ratio < triggerThreshold) fill(255, 50, 50);
+      else fill(50, 255, 50);
+      
+      text((ratio*100).toFixed(2) + "%", width-320, 255);
+
+      textAlign(CENTER, CENTER);
+      textSize(20);
+      fill(255);
+      let panelCenterX = width - (sw/2);
+
+      let statusY = 320; 
+
+      if (calibrating) {
+        fill(255, 204, 0);
+        text("DO NOT MOVE THE\nLIGHT SENSOR", panelCenterX, statusY);
+      } else if (animating) {
+        fill(255, 204, 0);
+        text("TRANSIT CONFIRMED\nDIP DEPTH: " + (recordedDipRatio * 100).toFixed(2) + "%", panelCenterX, statusY);
+      } else if (transitActive) {
+        fill(255, 50, 50);
+        text("DETECTION IN PROGRESS...", panelCenterX, statusY);
+      } else if (systemReady) {
+        fill(50, 255, 50);
+        text("STATUS: SCANNING...", panelCenterX, statusY);
+      } else if (maxLux > 2) {
+        fill(100);
+        text("STATUS: WAITING", panelCenterX, statusY);
+      } else {
+        fill(100);
+        text("CONNECT PORT", panelCenterX, statusY);
+      }
+    }
+
+    function drawGraph() {
+      textAlign(LEFT, BASELINE); 
+      noFill();
+      stroke(0, 255, 0, 150);
+      strokeWeight(2);
+      beginShape();
+      for (let i = 0; i < 400; i++) {
+        let x = map(i, 0, 400, width-320, width-50);
+        let y = map(historyData[i], 90, 100, height-100, height-250); 
+        vertex(x, y);
+      }
+      endShape();
+      fill(255, 150);
+      textSize(12);
+      noStroke();
+      text("LIGHT CURVE (90% - 100%)", width-320, height-260);
+    }
+
+    function drawStar(x, y, d, b) {
+      noStroke();
+      for (let i = 12; i > 0; i--) {
+        fill(255, 140, 0, (b/i) * 0.15);
+        ellipse(x, y, d+i*45, d+i*45);
+      }
+      fill(255, 255, 230, b);
+      ellipse(x, y, d, d);
+    }
+
+    function windowResized() {
+      resizeCanvas(windowWidth, windowHeight);
+    }
+
+    // Simple 1D Kalman Filter execution
+    function applyKalmanFilter(measurement) {
+      if (!kalmanInitialized) {
+        kf_current_estimate = measurement;
+        kalmanInitialized = true;
+      }
+
+      // Prediction update
+      kf_err_estimate = kf_err_estimate + kf_q;
+
+      // Measurement update
+      let kalmanGain = kf_err_estimate / (kf_err_estimate + kf_err_measure);
+      kf_current_estimate = kf_current_estimate + kalmanGain * (measurement - kf_current_estimate);
+      kf_err_estimate = (1.0 - kalmanGain) * kf_err_estimate;
+
+      return kf_current_estimate;
+    }
+
+    async function connectSerial() {
+      if (!('serial' in navigator)) {
+        alert("Web Serial API is not supported in this browser.");
+        return;
+      }
+
+      try {
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+        
+        connectBtn.style.display = 'none';
+        lockStarBtn.style.display = 'block';
+
+        const textDecoder = new TextDecoderStream();
+        const readableStreamClosed = port.readable.pipeTo(textDecoder.writable);
+        reader = textDecoder.readable.getReader();
+
+        let buffer = "";
+        
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          
+          buffer += value;
+          let lines = buffer.split('\n');
+          buffer = lines.pop(); 
+          
+          for (let line of lines) {
+            let parts = line.trim().split(':');
+            if (parts.length >= 2) {
+              let parsedValue = parseFloat(parts[1]);
+              if (!isNaN(parsedValue)) {
+                // Pass the raw sensor data through the Kalman filter
+                luxValue = applyKalmanFilter(parsedValue);
+              }
+            }
+          }
+        }
+      } catch (error) {
+        console.error("Error accessing the serial port:", error);
+      }
+    }
+  </script>
+</body>
+</html>
